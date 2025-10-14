@@ -6,8 +6,9 @@
 </head>
 <body>
   <h2>WebRTC Голосовой Чат с TURN</h2>
-  <p id="status">Подключение...</p>
+  <p id="status">Ожидание разрешения на микрофон...</p>
 
+  <button id="allowMicBtn">Разрешить захват звука</button>
   <button id="startAudioBtn" style="display:none;">Включить звук</button>
 
   <script>
@@ -131,26 +132,28 @@
       log("Ошибка WebSocket: " + err.message);
     };
 
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(stream => {
-        localStream = stream;
-        log("Получен локальный аудиопоток");
+    document.getElementById('allowMicBtn').addEventListener('click', () => {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+          localStream = stream;
+          log("Получен локальный аудиопоток");
 
-        // Показать кнопку для разблокировки звука на мобильных
-        document.getElementById('startAudioBtn').style.display = 'inline-block';
+          document.getElementById('allowMicBtn').style.display = 'none';
+          document.getElementById('startAudioBtn').style.display = 'inline-block';
 
-        safeSend({ type: "ready", name });
+          safeSend({ type: "ready", name });
 
-        // Генерируем TURN credentials при старте (чтобы использовать при соединениях)
-        generateTurnCredentials(name, staticAuthSecret).then(creds => {
-          turnCredentials = creds;
-          log(`TURN credentials получены: username=${creds.username}`);
+          // Генерируем TURN credentials при старте (чтобы использовать при соединениях)
+          generateTurnCredentials(name, staticAuthSecret).then(creds => {
+            turnCredentials = creds;
+            log(`TURN credentials получены: username=${creds.username}`);
+          });
+        })
+        .catch(err => {
+          log("Ошибка доступа к микрофону: " + err.message);
+          console.error(err);
         });
-      })
-      .catch(err => {
-        log("Ошибка доступа к микрофону: " + err.message);
-        console.error(err);
-      });
+    });
 
     document.getElementById('startAudioBtn').addEventListener('click', () => {
       for (const peerName in peerConnections) {
@@ -165,73 +168,78 @@
       log('Звук включен пользователем');
     });
 
+    // --- Остальной код без изменений ---
+
     function createPeerConnection(peerName) {
-  log(`Создаем RTCPeerConnection для ${peerName}, useTurn=${useTurn}`);
+      log(`Создаем RTCPeerConnection для ${peerName}, useTurn=${useTurn}`);
 
-  if (!turnCredentials) {
-    log("Ошибка: TURN credentials ещё не сгенерированы!");
-    return null;
-  }
-
-  const iceServers = [{
-    urls: turnServerUrl,
-    username: turnCredentials.username,
-    credential: turnCredentials.password
-  }];
-
-  const pc = new RTCPeerConnection({
-    iceServers,
-    iceTransportPolicy: "all"
-  });
-
-  if (useTurn) {
-    console.log(`Соединение с ${peerName} устанавливается через TURN (relay)`);
-  }
-
-  pc.onicecandidate = (evt) => {
-    if (evt.candidate) {
-      log(`Локальный кандидат для ${peerName}: ${JSON.stringify(evt.candidate)}`);
-      safeSend({
-        type: "ice-candidate",
-        candidate: evt.candidate,
-        to: peerName,
-        from: name
-      });
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    log(`ICE состояние (${peerName}): ${pc.iceConnectionState}`);
-    if (["failed", "disconnected"].includes(pc.iceConnectionState)) {
-      log(`Соединение с ${peerName} не удалось, переключаемся на TURN...`);
-
-      if (!useTurn) {
-        useTurn = true;
-        console.log(`Переключаемся на соединение через TURN (relay) с ${peerName}`);
-        // Закрываем текущее соединение
-        pc.close();
-        delete peerConnections[peerName];
-        setTimeout(() => {
-          log("Повторная попытка подключения через TURN");
-          createOffer(peerName);
-        }, 1500);
+      if (!turnCredentials) {
+        log("Ошибка: TURN credentials ещё не сгенерированы!");
+        return null;
       }
+
+      const iceServers = [{
+        urls: turnServerUrl,
+        username: turnCredentials.username,
+        credential: turnCredentials.password
+      },
+      {
+        urls: 'stun:stun.l.google.com:19302'  // Google STUN сервер
+      }];
+
+      const pc = new RTCPeerConnection({
+        iceServers,
+        iceTransportPolicy: "all"  // Используем все типы соединений (включая TURN)
+      });
+
+      if (useTurn) {
+        console.log(`Соединение с ${peerName} устанавливается через TURN (relay)`);
+      }
+
+      pc.onicecandidate = (evt) => {
+        if (evt.candidate) {
+          log(`Локальный кандидат для ${peerName}: ${JSON.stringify(evt.candidate)}`);
+          safeSend({
+            type: "ice-candidate",
+            candidate: evt.candidate,
+            to: peerName,
+            from: name
+          });
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE состояние (${peerName}): ${pc.iceConnectionState}`);
+        if (["failed", "disconnected"].includes(pc.iceConnectionState)) {
+          log(`Соединение с ${peerName} не удалось, переключаемся на TURN...`);
+
+          if (!useTurn) {
+            useTurn = true;
+            console.log(`Переключаемся на соединение через TURN (relay) с ${peerName}`);
+            // Закрываем текущее соединение
+            pc.close();
+            delete peerConnections[peerName];
+            setTimeout(() => {
+              log("Повторная попытка подключения через TURN");
+              createOffer(peerName);
+            }, 1500);
+          }
+        }
+      };
+
+      pc.ontrack = (evt) => {
+        log(`Получен трек от ${peerName}`);
+        const remoteStream = evt.streams[0];
+        attachAudio(peerName, remoteStream);
+      };
+
+      if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      peerConnections[peerName] = pc;
+      return pc;
     }
-  };
-
-  pc.ontrack = (evt) => {
-    log(`Получен трек от ${peerName}`);
-    const remoteStream = evt.streams[0];
-    attachAudio(peerName, remoteStream);
-  };
-
-  if (localStream) {
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  }
-
-  peerConnections[peerName] = pc;
-  return pc;
-}
 
     async function createOffer(to) {
       let pc = peerConnections[to];
