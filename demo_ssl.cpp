@@ -163,10 +163,19 @@ public:
         beast::error_code ec;
 
         acceptor_.open(endpoint.protocol(), ec);
-        acceptor_.set_option(net::socket_base::reuse_address(true), ec);
-        acceptor_.bind(endpoint, ec);
-        acceptor_.listen(net::socket_base::max_listen_connections, ec);
+        if (ec) std::cerr << "open error: " << ec.message() << "\n";
 
+        acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+        if (ec) std::cerr << "set_option error: " << ec.message() << "\n";
+
+        acceptor_.bind(endpoint, ec);
+        if (ec) std::cerr << "bind error: " << ec.message() << "\n";
+
+        acceptor_.listen(net::socket_base::max_listen_connections, ec);
+        if (ec) std::cerr << "listen error: " << ec.message() << "\n";
+    }
+
+    void start() {
         do_accept();
     }
 
@@ -178,6 +187,8 @@ private:
         acceptor_.async_accept([self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
                 std::make_shared<session>(std::move(socket), self->ctx_)->run();
+            } else {
+                std::cerr << "Accept error: " << ec.message() << "\n";
             }
             self->do_accept();
         });
@@ -187,17 +198,17 @@ private:
 int main() {
     try {
         net::io_context ioc;
-		
-		ssl::context ctx(ssl::context::tlsv12_server);
-        ctx.use_certificate_file("myCA/certificates/server/server.cert.pem", ssl::context::pem);
-        ctx.use_private_key_file("myCA/certificates/server/server.key.pem", ssl::context::pem);
 
-        auto local_ip = net::ip::make_address("62.109.0.102");
+        ssl::context ctx(ssl::context::tlsv12_server);
+        ctx.use_certificate_file("/etc/letsencrypt/live/gregere68.fvds.ru/fullchain.pem", ssl::context::pem);
+        ctx.use_private_key_file("/etc/letsencrypt/live/gregere68.fvds.ru/privkey.pem", ssl::context::pem);
 
-        auto endpoint = tcp::endpoint(net::ip::make_address("0.0.0.0"), 2222);
-        std::make_shared<listener>(ioc, ctx, endpoint);
+        auto endpoint = tcp::endpoint(net::ip::make_address("62.109.0.102"), 2222);
+        auto server = std::make_shared<listener>(ioc, ctx, endpoint);
+        server->start();
 
-        std::cout << "🔒 TLS WebSocket сервер запущен на порту 2222\n";
+        std::cout << "⚡ TLS WebSocket сервер запущен на порту 2222\n";
+
         ioc.run();
     } catch (const std::exception& e) {
         std::cerr << "Ошибка: " << e.what() << "\n";
