@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebRTC Голосовой Чат</title>
+</head>
+<body>
+  <h2>WebRTC Голосовой Чат</h2>
+  <p id="status">Подключение...</p>
+
+  <script>
+    const name = prompt("Введите имя:");
+    const room = "room1";
+    const signalingUrl = "ws://192.168.0.3:2222"; // Укажи свой IP или localhost
+
+    let localStream;
+    const peerConnections = {};
+    const socket = new WebSocket(signalingUrl);
+
+    let socketReady = false;
+    let messageQueue = [];
+
+    // Безопасная отправка — учитывает состояние WebSocket
+    function safeSend(message) {
+      const data = typeof message === "string" ? message : JSON.stringify(message);
+      if (socketReady) {
+        socket.send(data);
+      } else {
+        messageQueue.push(data);
+      }
+    }
+
+    // Обработка открытия WebSocket
+    socket.onopen = () => {
+      socketReady = true;
+      log("WebSocket открыт");
+
+      // Отправка накопленных сообщений
+      messageQueue.forEach(msg => socket.send(msg));
+      messageQueue = [];
+
+      safeSend({ type: "register", name });
+      safeSend({ type: "join_room", room });
+
+      if (localStream) {
+        safeSend({ type: "ready", name });
+      }
+    };
+
+    // Обработка сообщений от signaling-сервера
+    socket.onmessage = async (event) => {
+      const data = JSON.parse(event.data);
+      const from = data.from;
+
+      switch (data.type) {
+        case "ready":
+          if (from !== name && !peerConnections[from]) {
+            log(`Пользователь ${from} готов — создаём offer`);
+            await createOffer(from);
+          }
+          break;
+
+        case "offer":
+          log(`Получен offer от ${from}`);
+          await handleOffer(from, data.sdp);
+          break;
+
+        case "answer":
+          log(`Получен answer от ${from}`);
+          await peerConnections[from]?.setRemoteDescription(
+            new RTCSessionDescription({ type: "answer", sdp: data.sdp })
+          );
+          break;
+
+        case "ice-candidate":
+          log(`Получен ICE-кандидат от ${from}`);
+          const candidate = new RTCIceCandidate(data.candidate);
+          await peerConnections[from]?.addIceCandidate(candidate);
+          break;
+
+        default:
+          console.warn("Неизвестный тип сообщения:", data);
+      }
+    };
+
+    // Получение доступа к микрофону
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      localStream = stream;
+      log("Доступ к микрофону получен");
+
+      // Отправка "ready", если WebSocket уже открыт
+      safeSend({ type: "ready", name });
+    }).catch(err => {
+      log("❌ Ошибка доступа к микрофону: " + err.message);
+    });
+
+    // Создание нового RTCPeerConnection без STUN
+    function createPeerConnection(peerName) {
+      const pc = new RTCPeerConnection({
+        iceServers: [] // Только локальная сеть
+      });
+
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          safeSend({
+            type: "ice-candidate",
+            room,
+            from: name,
+            to: peerName,
+            candidate: event.candidate
+          });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        const remoteStream = event.streams[0];
+        const audio = document.createElement("audio");
+        audio.srcObject = remoteStream;
+        audio.controls = true;
+        audio.autoplay = false; // отключаем autoplay для обхода блокировки
+
+        document.body.appendChild(audio);
+
+        // Кнопка для запуска звука вручную (для Android)
+        const btn = document.createElement("button");
+        btn.textContent = `Включить звук от ${peerName}`;
+        btn.onclick = () => {
+          audio.play().catch(err => console.warn("Ошибка воспроизведения:", err));
+          btn.remove(); // скрываем кнопку после запуска звука
+        };
+        document.body.appendChild(btn);
+
+        log(`Получен аудиопоток от ${peerName}`);
+      };
+
+      if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      pc.oniceconnectionstatechange = () => {
+        console.log(`ICE состояние (${peerName}):`, pc.iceConnectionState);
+      };
+
+      peerConnections[peerName] = pc;
+      return pc;
+    }
+
+    // Создание и отправка offer
+    async function createOffer(to) {
+      const pc = createPeerConnection(to);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      safeSend({
+        type: "offer",
+        room,
+        from: name,
+        to,
+        sdp: offer.sdp
+      });
+    }
+
+    // Обработка входящего offer и отправка answer
+    async function handleOffer(from, sdp) {
+      const pc = createPeerConnection(from);
+      await pc.setRemoteDescription(new RTCSessionDescription({
+        type: "offer",
+        sdp
+      }));
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      safeSend({
+        type: "answer",
+        room,
+        from: name,
+        to: from,
+        sdp: answer.sdp
+      });
+    }
+
+    // Вывод статуса
+    function log(msg) {
+      console.log(msg);
+      document.getElementById("status").innerText = msg;
+    }
+  </script>
+</body>
+</html>
