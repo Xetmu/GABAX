@@ -1,23 +1,28 @@
-#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/asio/strand.hpp>
 #include <boost/asio/ssl.hpp>
-#include <boost/beast.hpp>
 #include <boost/json.hpp>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
-#include <memory>
-#include <iostream>
 #include <mutex>
 
-namespace net = boost::asio;
-namespace ssl = boost::asio::ssl;
 namespace beast = boost::beast;
+namespace http = beast::http;
 namespace websocket = beast::websocket;
+namespace net = boost::asio;
+namespace ssl = net::ssl;
 namespace json = boost::json;
 using tcp = net::ip::tcp;
 
-// Используем ssl stream поверх tcp::socket
-using ssl_stream = ssl::stream<tcp::socket>;
-using ws_ptr = std::shared_ptr<websocket::stream<ssl_stream>>;
+std::mutex global_mutex;
+using ws_stream = websocket::stream<beast::ssl_stream<beast::tcp_stream>>;
+using ws_ptr = std::shared_ptr<ws_stream>;
 
 struct Client {
     std::string name;
@@ -25,14 +30,13 @@ struct Client {
     ws_ptr socket;
 };
 
-std::mutex global_mutex;
 std::unordered_map<std::string, std::shared_ptr<Client>> clients;
 std::unordered_map<std::string, std::unordered_set<std::string>> rooms;
 
 void send_message(ws_ptr ws, const std::string& msg) {
     ws->async_write(net::buffer(msg), [msg](beast::error_code ec, std::size_t) {
         if (ec) {
-            std::cerr << "Ошибка отправки сообщения: " << ec.message() << "\n";
+            std::cerr << "Ошибка отправки: " << ec.message() << "\n";
         }
     });
 }
@@ -40,7 +44,6 @@ void send_message(ws_ptr ws, const std::string& msg) {
 void broadcast_to_room(const std::string& room, const std::string& from, const std::string& msg) {
     std::lock_guard<std::mutex> lock(global_mutex);
     if (!rooms.count(room)) return;
-
     for (const auto& name : rooms[room]) {
         if (name != from && clients.count(name)) {
             send_message(clients[name]->socket, msg);
@@ -50,26 +53,19 @@ void broadcast_to_room(const std::string& room, const std::string& from, const s
 
 class session : public std::enable_shared_from_this<session> {
 public:
-    explicit session(tcp::socket&& socket, ssl::context& ctx)
-        : ws_(std::make_shared<websocket::stream<ssl_stream>>(ssl_stream(std::move(socket), ctx))) {}
+    session(tcp::socket&& socket, ssl::context& ctx)
+        : ws_(std::make_shared<ws_stream>(std::move(socket), ctx)) {}
 
-    void start() {
+    void run() {
         auto self = shared_from_this();
-        // TLS handshake сначала
+        beast::get_lowest_layer(*ws_).expires_after(std::chrono::seconds(30));
         ws_->next_layer().async_handshake(ssl::stream_base::server,
             [self](beast::error_code ec) {
                 if (ec) {
-                    std::cerr << "Ошибка SSL handshake: " << ec.message() << "\n";
+                    std::cerr << "SSL Handshake Error: " << ec.message() << "\n";
                     return;
                 }
-                // После успешного TLS handshake — принимаем websocket
-                self->ws_->async_accept([self](beast::error_code ec) {
-                    if (ec) {
-                        std::cerr << "Ошибка accept: " << ec.message() << "\n";
-                        return;
-                    }
-                    self->do_read();
-                });
+                self->do_accept();
             });
     }
 
@@ -77,12 +73,23 @@ private:
     ws_ptr ws_;
     beast::flat_buffer buffer_;
     std::string client_name;
-    std::string current_room;
+
+    void do_accept() {
+        auto self = shared_from_this();
+        ws_->async_accept([self](beast::error_code ec) {
+            if (ec) {
+                std::cerr << "WebSocket accept error: " << ec.message() << "\n";
+                return;
+            }
+            self->do_read();
+        });
+    }
 
     void do_read() {
-        ws_->async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t) {
+        auto self = shared_from_this();
+        ws_->async_read(buffer_, [self](beast::error_code ec, std::size_t bytes_transferred) {
             if (ec) {
-                self->handle_disconnect();
+                self->on_disconnect();
                 return;
             }
 
@@ -101,70 +108,65 @@ private:
 
             if (type == "register") {
                 client_name = json::value_to<std::string>(val.at("name"));
-                auto client = std::make_shared<Client>(Client{client_name, "", ws_});
                 {
                     std::lock_guard<std::mutex> lock(global_mutex);
-                    clients[client_name] = client;
+                    clients[client_name] = std::make_shared<Client>(Client{client_name, "", ws_});
                 }
                 std::cout << "Клиент зарегистрирован: " << client_name << "\n";
-
             } else if (type == "join_room") {
                 std::string room = json::value_to<std::string>(val.at("room"));
                 {
                     std::lock_guard<std::mutex> lock(global_mutex);
                     if (clients.count(client_name)) {
-                        if (!clients[client_name]->room.empty()) {
-                            rooms[clients[client_name]->room].erase(client_name);
+                        auto& client = clients[client_name];
+                        if (!client->room.empty()) {
+                            rooms[client->room].erase(client_name);
                         }
-
-                        clients[client_name]->room = room;
+                        client->room = room;
                         rooms[room].insert(client_name);
-                        current_room = room;
-
-                        std::cout << client_name << " присоединился к комнате " << room << "\n";
                     }
                 }
-
+                std::cout << client_name << " присоединился к " << room << "\n";
             } else if (type == "offer" || type == "answer" || type == "ice-candidate" || type == "ready") {
                 std::lock_guard<std::mutex> lock(global_mutex);
                 if (clients.count(client_name)) {
-                    const std::string& room = clients[client_name]->room;
-                    if (!room.empty()) {
-                        val["from"] = client_name;
-                        std::string updated_msg = json::serialize(val);
-                        broadcast_to_room(room, client_name, updated_msg);
-                    }
+                    auto& client = clients[client_name];
+                    std::string room = client->room;
+                    val["from"] = client_name;
+                    std::string serialized = json::serialize(val);
+                    broadcast_to_room(room, client_name, serialized);
                 }
-
-            } else {
-                std::cerr << "Неизвестный тип сообщения: " << type << "\n";
             }
 
         } catch (const std::exception& e) {
-            std::cerr << "Ошибка обработки JSON: " << e.what() << "\n";
+            std::cerr << "Ошибка разбора JSON: " << e.what() << "\n";
         }
     }
 
-    void handle_disconnect() {
+    void on_disconnect() {
         std::lock_guard<std::mutex> lock(global_mutex);
-        if (!client_name.empty()) {
-            if (clients.count(client_name)) {
-                std::string room = clients[client_name]->room;
-                if (!room.empty()) {
-                    rooms[room].erase(client_name);
-                    std::cout << client_name << " покинул комнату " << room << "\n";
-                }
-                clients.erase(client_name);
-                std::cout << "Клиент отключён: " << client_name << "\n";
+        if (!client_name.empty() && clients.count(client_name)) {
+            std::string room = clients[client_name]->room;
+            if (!room.empty()) {
+                rooms[room].erase(client_name);
             }
+            clients.erase(client_name);
+            std::cout << "Клиент отключён: " << client_name << "\n";
         }
     }
 };
 
-class server {
+class listener : public std::enable_shared_from_this<listener> {
 public:
-    server(net::io_context& ioc, ssl::context& ctx, tcp::endpoint endpoint)
-        : acceptor_(ioc, endpoint), ctx_(ctx) {
+    listener(net::io_context& ioc, ssl::context& ctx, tcp::endpoint endpoint)
+        : acceptor_(ioc), ctx_(ctx) {
+        beast::error_code ec;
+
+        acceptor_.open(endpoint.protocol(), ec);
+        acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+        acceptor_.bind(endpoint, ec);
+        acceptor_.listen(net::socket_base::max_listen_connections, ec);
+
         do_accept();
     }
 
@@ -173,13 +175,11 @@ private:
     ssl::context& ctx_;
 
     void do_accept() {
-        acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
+        acceptor_.async_accept([self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<session>(std::move(socket), ctx_)->start();
-            } else {
-                std::cerr << "Ошибка accept: " << ec.message() << "\n";
+                std::make_shared<session>(std::move(socket), self->ctx_)->run();
             }
-            do_accept();
+            self->do_accept();
         });
     }
 };
@@ -187,20 +187,19 @@ private:
 int main() {
     try {
         net::io_context ioc;
-
-        // SSL context и загрузка сертификатов
-        ssl::context ctx(ssl::context::tlsv12_server);
+		
+		ssl::context ctx(ssl::context::tlsv12_server);
         ctx.use_certificate_file("myCA/certificates/server/server.cert.pem", ssl::context::pem);
         ctx.use_private_key_file("myCA/certificates/server/server.key.pem", ssl::context::pem);
 
         auto local_ip = net::ip::make_address("62.109.0.102");
-        tcp::endpoint endpoint(local_ip, 2222);
 
-        server srv(ioc, ctx, endpoint);
-        std::cout << "Signaling-сервер с TLS запущен на " << local_ip.to_string() << ":2222\n";
+        auto endpoint = tcp::endpoint(net::ip::make_address("0.0.0.0"), 2222);
+        std::make_shared<listener>(ioc, ctx, endpoint);
 
+        std::cout << "🔒 TLS WebSocket сервер запущен на порту 2222\n";
         ioc.run();
     } catch (const std::exception& e) {
-        std::cerr << "Ошибка запуска сервера: " << e.what() << "\n";
+        std::cerr << "Ошибка: " << e.what() << "\n";
     }
 }
