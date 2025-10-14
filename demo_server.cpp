@@ -1,0 +1,188 @@
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <boost/json.hpp>
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
+#include <iostream>
+#include <mutex>
+
+namespace net = boost::asio;
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace json = boost::json;
+using tcp = net::ip::tcp;
+
+using ws_ptr = std::shared_ptr<websocket::stream<tcp::socket>>;
+
+struct Client {
+    std::string name;
+    std::string room;
+    ws_ptr socket;
+};
+
+std::mutex global_mutex;
+std::unordered_map<std::string, std::shared_ptr<Client>> clients;
+std::unordered_map<std::string, std::unordered_set<std::string>> rooms;
+
+void send_message(ws_ptr ws, const std::string& msg) {
+    ws->async_write(net::buffer(msg), [msg](beast::error_code ec, std::size_t) {
+        if (ec) {
+            std::cerr << "Ошибка отправки сообщения: " << ec.message() << "\n";
+        }
+    });
+}
+
+// Отправляем сообщение всем клиентам в комнате, кроме отправителя
+void broadcast_to_room(const std::string& room, const std::string& from, const std::string& msg) {
+    if (!rooms.count(room)) return;
+
+    for (const auto& name : rooms[room]) {
+        if (name != from && clients.count(name)) {
+            send_message(clients[name]->socket, msg);
+        }
+    }
+}
+
+class session : public std::enable_shared_from_this<session> {
+public:
+    explicit session(tcp::socket&& socket)
+        : ws_(std::make_shared<websocket::stream<tcp::socket>>(std::move(socket))) {}
+
+    void start() {
+        ws_->async_accept([self = shared_from_this()](beast::error_code ec) {
+            if (ec) {
+                std::cerr << "Ошибка accept: " << ec.message() << "\n";
+                return;
+            }
+            self->do_read();
+        });
+    }
+
+private:
+    ws_ptr ws_;
+    beast::flat_buffer buffer_;
+    std::string client_name;
+    std::string current_room;
+
+    void do_read() {
+        ws_->async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) {
+                self->handle_disconnect();
+                return;
+            }
+
+            std::string msg = beast::buffers_to_string(self->buffer_.data());
+            self->buffer_.consume(self->buffer_.size());
+
+            self->handle_message(msg);
+            self->do_read();
+        });
+    }
+
+    void handle_message(const std::string& msg) {
+        try {
+            auto val = json::parse(msg).as_object();
+            std::string type = json::value_to<std::string>(val.at("type"));
+
+            if (type == "register") {
+                client_name = json::value_to<std::string>(val.at("name"));
+                auto client = std::make_shared<Client>(Client{client_name, "", ws_});
+                {
+                    std::lock_guard<std::mutex> lock(global_mutex);
+                    clients[client_name] = client;
+                }
+                std::cout << "Клиент зарегистрирован: " << client_name << "\n";
+
+            } else if (type == "join_room") {
+                std::string room = json::value_to<std::string>(val.at("room"));
+                {
+                    std::lock_guard<std::mutex> lock(global_mutex);
+                    if (clients.count(client_name)) {
+                        // Удалить из старой комнаты
+                        if (!clients[client_name]->room.empty()) {
+                            rooms[clients[client_name]->room].erase(client_name);
+                        }
+
+                        clients[client_name]->room = room;
+                        rooms[room].insert(client_name);
+                        current_room = room;
+
+                        std::cout << client_name << " присоединился к комнате " << room << "\n";
+                    }
+                }
+
+            } else if (type == "offer" || type == "answer" || type == "ice-candidate" || type == "ready") {
+                std::lock_guard<std::mutex> lock(global_mutex);
+                if (clients.count(client_name)) {
+                    const std::string& room = clients[client_name]->room;
+                    if (!room.empty()) {
+                        val["from"] = client_name;  // Добавляем поле "from"
+                        std::string updated_msg = json::serialize(val);
+                        broadcast_to_room(room, client_name, updated_msg);
+                    }
+                }
+
+            } else {
+                std::cerr << "Неизвестный тип сообщения: " << type << "\n";
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "Ошибка обработки JSON: " << e.what() << "\n";
+        }
+    }
+
+    void handle_disconnect() {
+        std::lock_guard<std::mutex> lock(global_mutex);
+        if (!client_name.empty()) {
+            if (clients.count(client_name)) {
+                std::string room = clients[client_name]->room;
+                if (!room.empty()) {
+                    rooms[room].erase(client_name);
+                    std::cout << client_name << " покинул комнату " << room << "\n";
+                }
+                clients.erase(client_name);
+                std::cout << "Клиент отключён: " << client_name << "\n";
+            }
+        }
+    }
+};
+
+class server {
+public:
+    server(net::io_context& ioc, tcp::endpoint endpoint)
+        : acceptor_(ioc, endpoint) {
+        do_accept();
+    }
+
+private:
+    tcp::acceptor acceptor_;
+
+    void do_accept() {
+        acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
+            if (!ec) {
+                std::make_shared<session>(std::move(socket))->start();
+            } else {
+                std::cerr << "Ошибка accept: " << ec.message() << "\n";
+            }
+            do_accept();  // Продолжить принимать соединения
+        });
+    }
+};
+
+int main() {
+    try {
+        net::io_context ioc;
+
+        // Использовать локальный IP, на который могут подключиться клиенты
+        auto local_ip = net::ip::make_address("62.109.0.102");  // Замените при необходимости
+        tcp::endpoint endpoint(local_ip, 2222);
+
+        server srv(ioc, endpoint);
+        std::cout << "Signaling-сервер запущен на " << local_ip.to_string() << ":2222\n";
+
+        ioc.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Ошибка запуска сервера: " << e.what() << "\n";
+    }
+}
