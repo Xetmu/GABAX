@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebRTC Голосовой Чат с TURN</title>
+</head>
+<body>
+  <h2>WebRTC Голосовой Чат с TURN</h2>
+  <p id="status">Подключение...</p>
+
+  <button id="startAudioBtn" style="display:none;">Включить звук</button>
+
+  <script>
+    const name = prompt("Введите имя:");
+    const room = "room1";
+    const signalingUrl = "wss://62.109.0.102:2222"; // твой сигналинг-сервер
+    const turnServerUrl = "turn:62.109.0.102:3478";
+    const staticAuthSecret = "your_secret_key"; // <-- твой static-auth-secret из конфига Coturn
+
+    let localStream = null;
+    const peerConnections = {};
+    const socket = new WebSocket(signalingUrl);
+    let socketReady = false;
+    let messageQueue = [];
+    let useTurn = false;
+    let turnCredentials = null; // сюда запишем username/password для TURN
+
+    function log(msg) {
+      console.log(msg);
+      const st = document.getElementById("status");
+      const t = new Date().toLocaleTimeString();
+      st.innerHTML += `<br>[${t}] ${msg}`;
+    }
+
+    function safeSend(obj) {
+      const data = JSON.stringify(obj);
+      if (socketReady) {
+        socket.send(data);
+      } else {
+        messageQueue.push(data);
+      }
+    }
+
+    // Функция генерации TURN credentials (long-term auth) с HMAC-SHA1
+    async function generateTurnCredentials(username, secret) {
+      const unixTime = Math.floor(Date.now() / 1000) + 24 * 3600; // истекает через 24 часа
+      const turnUsername = `${unixTime}:${username}`;
+
+      const encoder = new TextEncoder();
+      const keyData = encoder.encode(secret);
+      const msgData = encoder.encode(turnUsername);
+
+      const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        keyData,
+        { name: "HMAC", hash: "SHA-1" },
+        false,
+        ["sign"]
+      );
+
+      const signature = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+      const b64signature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+
+      return { username: turnUsername, password: b64signature };
+    }
+
+    socket.onopen = () => {
+      socketReady = true;
+      log("WebSocket открыт");
+      for (const msg of messageQueue) {
+        socket.send(msg);
+      }
+      messageQueue = [];
+      safeSend({ type: "register", name });
+      safeSend({ type: "join_room", room });
+
+      if (localStream) {
+        safeSend({ type: "ready", name });
+      }
+    };
+
+    socket.onmessage = async (evt) => {
+      let data;
+      try {
+        data = JSON.parse(evt.data);
+      } catch (err) {
+        console.error("Невозможно распарсить сообщение", evt.data);
+        return;
+      }
+      const from = data.from;
+      log("Получено сообщение: " + JSON.stringify(data));
+
+      switch (data.type) {
+        case "ready":
+          if (from !== name && !peerConnections[from]) {
+            log(`Пользователь ${from} готов — создаём offer`);
+            await createOffer(from);
+          }
+          break;
+        case "offer":
+          log(`Получен offer от ${from}`);
+          await handleOffer(from, data.sdp);
+          break;
+        case "answer":
+          log(`Получен answer от ${from}`);
+          if (peerConnections[from]) {
+            await peerConnections[from].setRemoteDescription(
+              new RTCSessionDescription({ type: "answer", sdp: data.sdp })
+            );
+          }
+          break;
+        case "ice-candidate":
+          log(`Получен ICE-кандидат от ${from}: ${JSON.stringify(data.candidate)}`);
+          if (peerConnections[from]) {
+            try {
+              await peerConnections[from].addIceCandidate(new RTCIceCandidate(data.candidate));
+            } catch (e) {
+              log(`Ошибка добавления ICE-кандидата: ${e.message}`);
+            }
+          }
+          break;
+        default:
+          console.warn("Неизвестный тип от signaling:", data.type);
+      }
+    };
+
+    socket.onclose = () => {
+      log("WebSocket закрыт");
+    };
+    socket.onerror = (err) => {
+      log("Ошибка WebSocket: " + err.message);
+    };
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(stream => {
+        localStream = stream;
+        log("Получен локальный аудиопоток");
+
+        // Показать кнопку для разблокировки звука на мобильных
+        document.getElementById('startAudioBtn').style.display = 'inline-block';
+
+        safeSend({ type: "ready", name });
+
+        // Генерируем TURN credentials при старте (чтобы использовать при соединениях)
+        generateTurnCredentials(name, staticAuthSecret).then(creds => {
+          turnCredentials = creds;
+          log(`TURN credentials получены: username=${creds.username}`);
+        });
+      })
+      .catch(err => {
+        log("Ошибка доступа к микрофону: " + err.message);
+        console.error(err);
+      });
+
+    document.getElementById('startAudioBtn').addEventListener('click', () => {
+      for (const peerName in peerConnections) {
+        const audioElem = document.getElementById(`audioelem-${peerName}`);
+        if (audioElem) {
+          audioElem.play().catch(err => {
+            console.warn('Ошибка при воспроизведении аудио:', err);
+          });
+        }
+      }
+      document.getElementById('startAudioBtn').style.display = 'none';
+      log('Звук включен пользователем');
+    });
+
+    function createPeerConnection(peerName) {
+  log(`Создаем RTCPeerConnection для ${peerName}, useTurn=${useTurn}`);
+
+  if (!turnCredentials) {
+    log("Ошибка: TURN credentials ещё не сгенерированы!");
+    return null;
+  }
+
+  const iceServers = [{
+    urls: turnServerUrl,
+    username: turnCredentials.username,
+    credential: turnCredentials.password
+  }];
+
+  const pc = new RTCPeerConnection({
+    iceServers,
+    iceTransportPolicy: useTurn ? "relay" : "all"
+  });
+
+  if (useTurn) {
+    console.log(`Соединение с ${peerName} устанавливается через TURN (relay)`);
+  }
+
+  pc.onicecandidate = (evt) => {
+    if (evt.candidate) {
+      log(`Локальный кандидат для ${peerName}: ${JSON.stringify(evt.candidate)}`);
+      safeSend({
+        type: "ice-candidate",
+        candidate: evt.candidate,
+        to: peerName,
+        from: name
+      });
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    log(`ICE состояние (${peerName}): ${pc.iceConnectionState}`);
+    if (["failed", "disconnected"].includes(pc.iceConnectionState)) {
+      log(`Соединение с ${peerName} не удалось, переключаемся на TURN...`);
+
+      if (!useTurn) {
+        useTurn = true;
+        console.log(`Переключаемся на соединение через TURN (relay) с ${peerName}`);
+        // Закрываем текущее соединение
+        pc.close();
+        delete peerConnections[peerName];
+        setTimeout(() => {
+          log("Повторная попытка подключения через TURN");
+          createOffer(peerName);
+        }, 1500);
+      }
+    }
+  };
+
+  pc.ontrack = (evt) => {
+    log(`Получен трек от ${peerName}`);
+    const remoteStream = evt.streams[0];
+    attachAudio(peerName, remoteStream);
+  };
+
+  if (localStream) {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
+
+  peerConnections[peerName] = pc;
+  return pc;
+}
+
+    async function createOffer(to) {
+      let pc = peerConnections[to];
+      if (!pc) {
+        pc = createPeerConnection(to);
+        if (!pc) {
+          log("Невозможно создать RTCPeerConnection, нет TURN credentials.");
+          return;
+        }
+      }
+      const offer = await pc.createOffer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(offer);
+      safeSend({ type: "offer", sdp: offer.sdp, to, from: name });
+      log(`Offer отправлен ${to}`);
+    }
+
+    async function handleOffer(from, sdp) {
+      let pc = peerConnections[from];
+      if (!pc) {
+        pc = createPeerConnection(from);
+        if (!pc) {
+          log("Невозможно создать RTCPeerConnection, нет TURN credentials.");
+          return;
+        }
+      }
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp }));
+      const answer = await pc.createAnswer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(answer);
+      safeSend({ type: "answer", sdp: answer.sdp, to: from, from: name });
+      log(`Answer отправлен ${from}`);
+    }
+
+    function attachAudio(peerName, stream) {
+      let container = document.getElementById(`audio-${peerName}`);
+      if (!container) {
+        container = document.createElement("div");
+        container.id = `audio-${peerName}`;
+        container.style.border = "1px solid #888";
+        container.style.margin = "5px";
+        container.style.padding = "5px";
+
+        const label = document.createElement("div");
+        label.textContent = `Пользователь: ${peerName}`;
+        container.appendChild(label);
+
+        const audio = document.createElement("audio");
+        audio.id = `audioelem-${peerName}`;
+        audio.autoplay = true;
+        audio.controls = true;
+        audio.muted = false;
+        audio.volume = 1.0;
+
+        audio.onloadedmetadata = () => {
+          audio.play().then(() => {
+            log(`Аудио от ${peerName} воспроизводится`);
+          }).catch(err => {
+            console.warn("Ошибка воспроизведения:", err);
+            log(`Ошибка воспроизведения: ${err.message}`);
+          });
+        };
+
+        container.appendChild(audio);
+        document.body.appendChild(container);
+      }
+      const audioElem = document.getElementById(`audioelem-${peerName}`);
+      audioElem.srcObject = stream;
+    }
+  </script>
+</body>
+</html>
