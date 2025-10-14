@@ -181,7 +181,7 @@
 
   const pc = new RTCPeerConnection({
     iceServers,
-    iceTransportPolicy: useTurn ? "relay" : "all"
+    iceTransportPolicy: "all"
   });
 
   if (useTurn) {
