@@ -192,7 +192,7 @@ int main() {
         ctx.use_certificate_file("myCA/certificates/server/server.cert.pem", ssl::context::pem);
         ctx.use_private_key_file("myCA/certificates/server/server.key.pem", ssl::context::pem);
 
-        auto local_ip = net::ip::make_address("172.28.210.12");
+        auto local_ip = net::ip::make_address("62.109.0.102");
         tcp::endpoint endpoint(local_ip, 2222);
 
         server srv(ioc, ctx, endpoint);
