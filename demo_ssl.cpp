@@ -38,6 +38,7 @@ void send_message(ws_ptr ws, const std::string& msg) {
 }
 
 void broadcast_to_room(const std::string& room, const std::string& from, const std::string& msg) {
+    std::lock_guard<std::mutex> lock(global_mutex);
     if (!rooms.count(room)) return;
 
     for (const auto& name : rooms[room]) {
