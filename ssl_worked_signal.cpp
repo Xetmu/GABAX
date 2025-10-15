@@ -225,7 +225,7 @@ int main() {
         ssl::context ctx(ssl::context::tlsv12_server);
         ctx.use_certificate_file("/etc/letsencrypt/live/gregere68.fvds.ru/fullchain.pem", ssl::context::pem);
         ctx.use_private_key_file("/etc/letsencrypt/live/gregere68.fvds.ru/privkey.pem", ssl::context::pem);
-
+   
         ctx.set_options(
             ssl::context::default_workarounds
             | ssl::context::no_sslv2
