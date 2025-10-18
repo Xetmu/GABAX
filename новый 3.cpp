@@ -136,10 +136,11 @@ private:
             if (type == "register") {
                 client_name = json::value_to<std::string>(val.at("name"));
                 auto client = std::make_shared<Client>(Client{client_name, "", ws_});
+				auto client_2 = std::make_shared<Client>(Client{client_name, "", ws_});
                 {
                     std::lock_guard<std::mutex> lock(global_mutex);
                     clients[client_name] = client;
-					clients_2[client_name] = client;
+					clients_2[client_name] = client_2;
                 }
                 std::cout << "Клиент зарегистрирован: " << client_name << "\n";
 
